@@ -20,15 +20,20 @@ class ProcessCreate:
         self.weight = 0
         self.manager = Manager()
         self.paused_event = self.manager.Event()
+        self.shutdown_flag = self.manager.Event()  # New shutdown flag
         self.paused_event.clear()
+        self.shutdown_flag.clear()
 
     def worker(self):
         p = psutil.Process(os.getpid())
-        p.cpu_affinity([0])
-        while True:
-            if self.paused_event.is_set():
-                self.paused_event.wait()
-            time.sleep(3)  # Simulate process execution
+        try:
+            while not self.shutdown_flag.is_set():  # Check shutdown flag
+                if self.paused_event.is_set():
+                    self.paused_event.wait()
+                time.sleep(3)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Handle termination gracefully
+
 
     def calculate_time_slice(self, p_weight, total_weight, target_latency=10):
         return (p_weight / total_weight) * target_latency
@@ -50,6 +55,7 @@ class Scheduler:
         self.process_list = []
         self.total_weight = 0
         self.notify_queue = notify_queue  # Shared queue for communication
+        self.terminated_processes = set()  # Track already terminated processes
 
     def add_processes(self, process_names=[], weights=[]):
         for i in range(len(process_names)):
@@ -64,11 +70,16 @@ class Scheduler:
                 "process_obj": p,
                 "weight": p.weight,
                 "paused_event": p.paused_event,
-                "exe_time": random.randint(0, 10),
+                "exe_time": random.randint(5, 15),  # Slightly longer execution times
                 "terminated": False  # Track termination state
             })
 
     def run_scheduler(self, process_names=[], weights=[]):
+        # Clear any existing processes to prevent duplicates
+        self.process_list = []
+        self.total_weight = 0
+        
+        # Add processes
         self.add_processes(process_names, weights)
 
         for process in self.process_list:
@@ -79,26 +90,55 @@ class Scheduler:
             process["paused_event"].set()  # Start paused
 
         while len(self.process_list) > 0:
+            # Sort processes by vRuntime (CFS principle)
             self.process_list.sort(key=lambda x: x["vRuntime"])
             process = self.process_list[0]
+            
+            # Skip if process has already been terminated
+            if process["name"] in self.terminated_processes:
+                self.process_list.remove(process)
+                continue
+                
             print(f"Running process: {process['name']} (Time Slice: {process['time_slice']:.2f}s)")
             
-            process["paused_event"].clear()
-            self.notify_queue.put({"name": process["name"], "vRuntime": process["vRuntime"], "status": "running"})
-            time.sleep(process["time_slice"])
+            try:
+                # Run the process
+                process["paused_event"].clear()
+                self.notify_queue.put({"name": process["name"], "vRuntime": process["vRuntime"], "status": "running"})
+                time.sleep(process["time_slice"])
+                
+                # Pause the process
+                process["paused_event"].set()
+                process["vRuntime"], _ = process["process_obj"].calculate_vRuntime(process["weight"], self.total_weight)
+                print(f"Process {process['name']} vRuntime: {process['vRuntime']}")
 
-            process["paused_event"].set()
-            process["vRuntime"], _ = process["process_obj"].calculate_vRuntime(process["weight"], self.total_weight)
-            print(f"Process {process['name']} vRuntime: {process['vRuntime']}")
-
-            if process["vRuntime"] > process["exe_time"] and not process["terminated"]:
-                process["process"].terminate()
-                process["terminated"] = True  # Mark as terminated
+                # Check if process should terminate
+                if process["vRuntime"] > process["exe_time"] and not process["terminated"]:
+                    try:
+                        if process["process"].is_alive():
+                            process["process_obj"].shutdown_flag.set()  # Signal shutdown
+                            process["paused_event"].set()  # Release if paused
+                            process["process"].terminate()
+                            process["process"].join()   # Wait briefly for termination
+                    except Exception as e:
+                        print(f"Error terminating process {process['name']}: {e}")
+                    
+                    # Mark as terminated and remove from list
+                    process["terminated"] = True
+                    self.terminated_processes.add(process["name"])  # Remember it's terminated
+                    self.notify_queue.put({"name": process["name"], "status": "terminated"})
+                    self.process_list.remove(process)
+                    print(f"Process {process['name']} terminated.")
+                else:
+                    print(f"Process {process['name']} paused.")
+            except Exception as e:
+                # Handle broken pipe or other errors
+                print(f"Error with process {process['name']}: {e}")
+                # Mark process as terminated and remove it
+                self.terminated_processes.add(process["name"])
                 self.notify_queue.put({"name": process["name"], "status": "terminated"})
                 self.process_list.remove(process)
-                print(f"Process {process['name']} terminated.")
-            else:
-                print(f"Process {process['name']} paused.")
+                print(f"Process {process['name']} removed due to error.")
 
 class Cube:
     vertices = [
@@ -157,7 +197,7 @@ class Scene:
         self.notify_queue = notify_queue
         self.scheduler = Scheduler(notify_queue)
         self.scheduler.add_processes(process_list, weights)
-        self.terminated_processes = []  # Track terminated processes
+        self.active_processes = process_list.copy()  # Track active processes
         self.vRuntimes = {proc: 0.0 for proc in process_list}  # Track vRuntime for each process
         
         for i, proc in enumerate(process_list):
@@ -167,8 +207,9 @@ class Scene:
         self.circle = Circle(position=(3, 6, 0), name="CPU")
 
     def draw(self):
+        # Only draw cubes for active processes
         for key, cube in self.cubes.items():
-            if isinstance(cube, Cube):
+            if isinstance(cube, Cube) and key in self.active_processes:
                 cube.draw()
         self.circle.draw()
 
@@ -184,19 +225,34 @@ class Scene:
                     self.vRuntimes[process_name] = message["vRuntime"]  # Update vRuntime
                     for key, cube in self.cubes.items():
                         if isinstance(cube, Cube):
-                            if key == process_name:
+                            if key == process_name and key in self.active_processes:
                                 cube.position = (3, 6, 0)  # Move to CPU
                                 cube.rotate(True)
                                 self.cubes[f"{key}_running"] = True
-                            else:
-                                cube.position = (int(key[-1]) * 4, 0, 0)  # Reset position
+                            elif key in self.active_processes:
+                                cube.position = (self.active_processes.index(key) * 4, 0, 0)  # Reset position
                                 cube.rotate(False)
                                 self.cubes[f"{key}_running"] = False
-                elif status == "terminated" and process_name not in self.terminated_processes:
-                    self.terminated_processes.append(process_name)
-                    print(f"Termination message processed for {process_name}")
+                                
+                elif status == "terminated" and process_name in self.active_processes:
+                    # Remove the process from active processes
+                    if process_name in self.active_processes:
+                        self.active_processes.remove(process_name)
+                    print(f"Process {process_name} removed from visualization")
+                    
+                    # Reposition remaining cubes to fill the gap
+                    self.reposition_cubes()
+                    
             except:
                 break  # Exit loop when queue is empty
+                
+    def reposition_cubes(self):
+        # Reposition all remaining active cubes
+        for i, proc_name in enumerate(self.active_processes):
+            if proc_name in self.cubes and isinstance(self.cubes[proc_name], Cube):
+                # Only reposition cubes that are not in the CPU
+                if not self.cubes[f"{proc_name}_running"]:
+                    self.cubes[proc_name].position = (i * 4, 0, 0)
 
 class App:
     def __init__(self, process_list, niceness):
@@ -249,9 +305,9 @@ class App:
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             self.scene.draw()
 
-            # Render process names above cubes
+            # Render process names above cubes (only for active processes)
             for key, cube in self.scene.cubes.items():
-                if isinstance(cube, Cube):
+                if isinstance(cube, Cube) and key in self.scene.active_processes:
                     screen_pos = self.project(cube.position[0], cube.position[1], cube.position[2])
                     self.render_text(cube.name, (screen_pos[0] - 20, screen_pos[1] - 50))
 
@@ -259,15 +315,13 @@ class App:
             circle_screen_pos = self.project(self.scene.circle.position[0], self.scene.circle.position[1], self.scene.circle.position[2])
             self.render_text(self.scene.circle.name, (circle_screen_pos[0] - 20, circle_screen_pos[1] - 110))
 
-            # Render static virtual runtime for each process on the left
-            for i, proc_name in enumerate(process_list):
-                runtime_text = f"The virtual Runtime of the process '{proc_name}' is {self.scene.vRuntimes[proc_name]:.2f}"
-                self.render_text(runtime_text, (10, 50 + i * 30))
+            # Render virtual runtime for active processes only
+            for i, proc_name in enumerate(self.scene.active_processes):
+                if proc_name in self.scene.vRuntimes:
+                    runtime_text = f"The virtual Runtime of the process '{proc_name}' is {self.scene.vRuntimes[proc_name]:.2f}"
+                    self.render_text(runtime_text, (10, 50 + i * 30))
 
-            # Render terminated processes on the right
-            for i, proc_name in enumerate(self.scene.terminated_processes):
-                term_text = f"The process '{proc_name}' is terminated"
-                self.render_text(term_text, (self.display[0] - 250, 50 + i * 30))
+            # Removed the terminated processes display as requested
 
             pygame.display.flip()
             clock.tick(60)  # 60 FPS
@@ -285,8 +339,8 @@ class App:
         pygame.quit()
 
 if __name__ == "__main__":
-    process_list = ["pro1", "pro2", "pro3"]
-    niceness = [-10, -10, -10]
+    process_list = ["pro1", "pro2","pro3","pro4"]
+    niceness = [-10, -5,0,5]
     app = App(process_list, niceness)
     app.run(process_list)
     app.quit()
