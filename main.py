@@ -37,7 +37,7 @@ class ProcessCreate:
                 elif self.paused_event.is_set():
                     self.paused_event.wait()
                 else:
-                    if random.random() < 0.8:  # Increased I/O chance
+                    if random.random() < 0.3:  # Increased I/O chance
                         self.io_waiting.value = True
                         self.io_duration.value = random.uniform(2, 4)
                     time.sleep(0.5)  # Reduced sleep time
@@ -448,8 +448,8 @@ class App:
         pygame.quit()
 
 if __name__ == "__main__":
-    process_list = ["pro1", "pro2"]
-    niceness = [-10, -10]  # Varying nice values for demonstration
+    process_list = ["pro1", "pro2","pro3","pro4"]
+    niceness = [-10, -10,-10,-10]  # Varying nice values for demonstration
     app = App(process_list, niceness)
     app.run(process_list)
     app.quit()
