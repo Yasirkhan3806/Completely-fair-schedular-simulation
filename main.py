@@ -37,9 +37,9 @@ class ProcessCreate:
                 elif self.paused_event.is_set():
                     self.paused_event.wait()
                 else:
-                    if random.random() < 0.3:  # Increased I/O chance
+                    if random.random() < 0.8:  # Increased I/O chance
                         self.io_waiting.value = True
-                        self.io_duration.value = random.uniform(1, 2)
+                        self.io_duration.value = random.uniform(2, 4)
                     time.sleep(0.5)  # Reduced sleep time
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -101,7 +101,10 @@ class Scheduler:
             if len(self.process_list) > 0:
                 self.process_list.sort(key=lambda x: x["vRuntime"])
                 process = self.process_list[0]
-                self.handle_io(process)
+                
+                # If process goes to I/O, continue with the next iteration to pick another process
+                if self.handle_io(process):
+                    continue
 
                 if process["name"] in self.terminated_processes:
                     self.process_list.remove(process)
@@ -161,14 +164,25 @@ class Scheduler:
 
     def handle_io(self, process):
         if process["process_obj"].io_waiting.value:
+            # Save the current vRuntime before moving to I/O
             process["process_obj"].last_vruntime.value = process["vRuntime"]
+            
+            # Add to I/O queue and remove from process list
             self.io_queue.append(process)
             self.process_list.remove(process)
+            
+            # Notify the visualization about the I/O event
             self.notify_queue.put({
                 "name": process['name'],
                 "status": "io_start",
                 "duration": process["process_obj"].io_duration.value
             })
+            
+            print(f"Process {process['name']} moved to I/O queue for {process['process_obj'].io_duration.value} seconds")
+            
+            # Return immediately to let the scheduler pick another process
+            return True
+        return False
 
 class Cube:
     vertices = [
@@ -266,51 +280,86 @@ class Scene:
                 if status == "running" and process_name in self.cubes:
                     self.vRuntimes[process_name] = message.get("vRuntime", 0)
                     self.time_slices[process_name] = message.get("time_slice", 0)
+                    
+                    # Mark the current process as running
+                    if process_name in self.active_processes:
+                        self.cubes[f"{process_name}_running"] = True
+                    
+                    # Mark all other processes as not running
+                    for key in self.active_processes:
+                        if key != process_name and key in self.cubes:
+                            self.cubes[f"{key}_running"] = False
+                    
+                    # Update positions based on current state
+                    self.reposition_cubes()
+                    
+                    # Rotate only the running process
                     for key, cube in self.cubes.items():
                         if isinstance(cube, Cube):
                             if key == process_name and key in self.active_processes:
-                                cube.position = (3, 6, 0)
                                 cube.rotate(True)
-                                self.cubes[f"{key}_running"] = True
-                            elif key in self.active_processes:
-                                cube.position = (self.active_processes.index(key) * 4, 0, 0)
+                            elif key in self.active_processes and key not in self.io_processes:
                                 cube.rotate(False)
-                                self.cubes[f"{key}_running"] = False
                                 
                 elif status == "terminated" and process_name in self.active_processes:
                     if process_name in self.active_processes:
                         self.active_processes.remove(process_name)
+                    if process_name in self.io_processes:
+                        del self.io_processes[process_name]
                     self.reposition_cubes()
 
-                if status == "io_start":
+                elif status == "io_start":
                     proc_name = message["name"]
                     if proc_name in self.cubes:
-                        self.cubes[proc_name].position = (12, 6, 0)
-                    self.io_processes[proc_name] = {
-                        "start_time": time.time(),
-                        "duration": message["duration"],
-                        "progress": 0
-                    }
+                        # Mark as not running when entering I/O
+                        self.cubes[f"{proc_name}_running"] = False
+                        
+                        self.io_processes[proc_name] = {
+                            "start_time": time.time(),
+                            "duration": message["duration"],
+                            "progress": 0
+                        }
+                        print(f"Process {proc_name} entering I/O state for {message['duration']} seconds")
+                    
+                    # Ensure we immediately update positions
+                    self.reposition_cubes()
+
                 elif status == "io_complete":
                     proc_name = message["name"]
                     if proc_name in self.io_processes:
+                        print(f"Process {proc_name} completed I/O")
                         del self.io_processes[proc_name]
+                    self.reposition_cubes()
                     
             except:
                 break
 
     def reposition_cubes(self):
         cpu_x, io_x, y_pos = 3, 12, 6
-        for i, proc_name in enumerate(self.active_processes):
+        # First handle I/O processes - this ensures they always appear at the I/O position
+        for proc_name in list(self.io_processes.keys()):
             if proc_name in self.cubes and isinstance(self.cubes[proc_name], Cube):
+                # Position at I/O circle
+                self.cubes[proc_name].position = (io_x, y_pos, 0)
+                self.cubes[f"{proc_name}_running"] = False
+                print(f"Repositioned {proc_name} to I/O position")
+        
+        # Then handle remaining processes
+        queue_index = 0
+        for proc_name in self.active_processes:
+            if proc_name in self.cubes and isinstance(self.cubes[proc_name], Cube):
+                # Skip if it's in I/O - we already handled it
                 if proc_name in self.io_processes:
-                    self.cubes[proc_name].position = (
-                        io_x + (i%2)*3, 
-                        y_pos - (i//2)*3, 
-                        0
-                    )
-                elif not self.cubes[f"{proc_name}_running"]:
-                    self.cubes[proc_name].position = (i * 4, 0, 0)
+                    continue
+                    
+                if self.cubes[f"{proc_name}_running"]:
+                    # Position at CPU circle
+                    self.cubes[proc_name].position = (cpu_x, y_pos, 0)
+                else:
+                    # Default position - use a counter for queue positions
+                    self.cubes[proc_name].position = (queue_index * 4, 0, 0)
+                    queue_index += 1
+
 
 class App:
     def __init__(self, process_list, niceness):
@@ -399,8 +448,8 @@ class App:
         pygame.quit()
 
 if __name__ == "__main__":
-    process_list = ["pro1", "pro2", "pro3", "pro4"]
-    niceness = [-10, -5, 0, 5]  # Varying nice values for demonstration
+    process_list = ["pro1", "pro2"]
+    niceness = [-10, -10]  # Varying nice values for demonstration
     app = App(process_list, niceness)
     app.run(process_list)
     app.quit()
